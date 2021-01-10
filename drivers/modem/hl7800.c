@@ -18,6 +18,7 @@ LOG_MODULE_REGISTER(modem_hl7800, CONFIG_MODEM_LOG_LEVEL);
 #include <drivers/gpio.h>
 #include <device.h>
 #include <init.h>
+#include <stdio.h>
 
 #include <power/power.h>
 #include <drivers/uart.h>
@@ -232,6 +233,20 @@ static const struct mdm_control_pinconfig pinconfig[] = {
 		  (GPIO_INPUT | GPIO_INT_EDGE_BOTH)),
 };
 
+
+uint8_t gnssloc_lineHeaders[] = {
+	10,	//Latitude
+	11, //Longitude
+	9,  //Time
+	9,  //Type
+	6,  //HEPE
+	10, //Altitude
+	8,  //Altitude Uncertainty
+	11, //Direction
+	10, //Horizontal Speed
+	10  //Vertical Speed
+};
+
 #define MDM_UART_DEV_NAME DT_INST_BUS_LABEL(0)
 
 #define MDM_WAKE_ASSERTED 1 /* Asserted keeps the module awake */
@@ -337,6 +352,12 @@ static const char TIME_STRING_FORMAT[] = "\"yy/MM/dd,hh:mm:ss?zz\"";
 #define SECONDS_PER_QUARTER_HOUR (15 * 60)
 #endif
 
+#define GNSS_EVENT_PARAM_LENGTH 4
+#define GNSS_POS_PARAM_COUNT 10
+#define GNSS_POS_FIX_TIMEOUT K_SECONDS(60)
+#define GNSS_POS_MAX_LENGTH 280 //Probably closer to 255 plus final "\r\n" plus NULL
+#define GNSS_POS_PARAM_MAX_LENGTH 40 //Lat and Lon are the longest
+
 #define SEND_AT_CMD_ONCE_EXPECT_OK(c)                                          \
 	do {                                                                   \
 		ret = send_at_cmd(NULL, (c), MDM_CMD_SEND_TIMEOUT, 0, false);  \
@@ -395,6 +416,19 @@ K_THREAD_STACK_DEFINE(hl7800_workq_stack,
 		      CONFIG_MODEM_HL7800_RX_WORKQ_STACK_SIZE);
 static struct k_work_q hl7800_workq;
 #define WORKQ_PRIORITY K_PRIO_COOP(7)
+struct k_work gnss_get_pos_work;
+struct k_work gnss_got_pos_work;
+struct k_work gnss_abandon_work;
+struct gnss_location_data location_data;
+
+char gnss_cardinal_shortLabel[] =
+{
+	' ',
+	'S',
+	'N',
+	'W',
+	'E'
+};
 
 static const char EOF_PATTERN[] = "--EOF--Pattern--";
 static const char CONNECT_STRING[] = "CONNECT";
@@ -544,6 +578,8 @@ static int modem_boot_handler(char *reason);
 static void mdm_vgpio_work_cb(struct k_work *item);
 static void mdm_reset_work_callback(struct k_work *item);
 static int write_apn(char *access_point_name);
+static bool on_cmd_gnss_fix_read (struct net_buf **buf, uint16_t len);
+static bool on_cmd_gnss_event (struct net_buf **buf, uint16_t len);
 
 #ifdef CONFIG_MODEM_HL7800_FW_UPDATE
 static char *get_fota_state_string(enum mdm_hl7800_fota_state state);
@@ -3342,6 +3378,10 @@ static void hl7800_rx(void)
 
 		/* FIRMWARE UPDATE RESPONSES */
 		CMD_HANDLER("+WDSI: ", device_service_ind),
+
+		//GNSS RESPONSES
+		CMD_HANDLER("+GNSSEV: ", gnss_event),
+		CMD_HANDLER("+GNSSLOC:", gnss_fix_read),
 	};
 
 	while (true) {
@@ -4889,3 +4929,389 @@ static struct net_if_api api_funcs = {
 NET_DEVICE_OFFLOAD_INIT(modem_hl7800, "MODEM_HL7800", hl7800_init,
 			device_pm_control_nop, &ictx, NULL,
 			CONFIG_MODEM_HL7800_INIT_PRIORITY, &api_funcs, MDM_MTU);
+
+struct k_timer gnss_fix_timer;
+
+void gnss_fix_abandon (struct k_work *work)
+{
+	int ret;
+	//Disable airplane mode
+	LOG_WRN("Unable to get GNSS data, cancelling...");
+	SEND_AT_CMD_EXPECT_OK("AT+CFUN=1,0");
+	//Report no fix available
+	location_data.type = GNSS_FIX_NONE;
+	if(location_data.callback != NULL)
+		location_data.callback(false);
+	return;
+error:
+	LOG_ERR("Unable to disable airplane mode! %d", ret);
+}
+
+K_WORK_DEFINE(gnss_abandon_work, gnss_fix_abandon);
+
+void gnss_fix_timer_expire ()
+{
+	LOG_WRN("GNSS Fix Timeout!");
+	k_work_submit(&gnss_abandon_work);
+}
+
+void gnss_get_pos (struct k_work *work)
+{
+	int ret;
+
+	//Request the location info
+	LOG_INF("GNSS fix found, requesting location");
+	SEND_AT_CMD_EXPECT_OK("AT+GNSSLOC?");
+
+error:
+	if(ret < 0)
+		k_work_submit(&gnss_abandon_work);
+}
+
+K_WORK_DEFINE(gnss_get_pos_work, gnss_get_pos);
+
+K_TIMER_DEFINE(gnss_fix_timer, gnss_fix_timer_expire, NULL);
+
+void start_gnss ()
+{
+	int ret;
+	//Enable airplane mode
+	LOG_INF("Starting GNSS...");
+	SEND_AT_CMD_EXPECT_OK("AT+CFUN=4,0");
+	//Start GNSS in auto mode
+	SEND_AT_CMD_EXPECT_OK("AT+GNSSSTART=0");
+	k_timer_start(&gnss_fix_timer, GNSS_POS_FIX_TIMEOUT, K_NO_WAIT);
+	
+
+error:
+	if(ret < 0) k_work_submit(&gnss_abandon_work);
+}
+
+static bool on_cmd_gnss_event (struct net_buf **buf, uint16_t len)
+{
+	size_t out_len;
+	char value[GNSS_EVENT_PARAM_LENGTH];
+	char *pos;
+	int l;
+	char val[GNSS_EVENT_PARAM_LENGTH];
+	int type;
+	int status;
+
+	out_len = net_buf_linearize(value, sizeof(value), *buf, 0, len);
+	pos = strchr(value, ',');
+	if (pos) {
+		l = pos - value;
+		strncpy(val, value, l);
+		val[l] = 0;
+		type = strtol(val, NULL, 0);
+
+		l = (value + out_len) - pos;
+		strncpy(val, pos + 1, l);
+		val[l] = 0;
+		status = strtol(val, NULL, 0);
+
+		LOG_DBG("GNSS Event: %d with a status of: %d", type, status);
+		switch(type)
+		{
+			case 0:			//Init
+				if(status == 0)
+					LOG_ERR("GNSS failed to initialize");
+				break;
+			case 1: 		//Start
+				if(status == 0)
+					LOG_ERR("GNSS failed to start");
+				break;
+			case 2: 		//Stop
+				if(status == 0)
+					LOG_ERR("GNSS failed to stop");
+				break;
+			case 3:			//Position
+				if(status == 4)
+					LOG_WRN("GNSS position invalid");
+				if(status == 2 || status == 3)
+				{
+					k_timer_stop(&gnss_fix_timer);
+					k_work_submit(&gnss_get_pos_work);
+				}
+				break;
+		}
+	}
+	return true;
+}
+
+char * find_next_gnss_param(char * buf, char delim)
+{
+	while(*buf != delim)
+	{
+		buf++;
+		if(*buf == '\0')
+			return NULL;
+	}
+	return buf + 1;
+}
+
+void convert_pos_dms_string_to_struct(struct gnss_coordinate * coordinate, char * buf)
+{
+	char * frag = buf;
+
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing dms position degree. String: %s", buf);
+		return;
+	}
+
+	if(strcmp(" ", frag) == 0 || *frag == 0)		//Position not available
+	{
+		coordinate->dms.degrees = coordinate->dms.minutes = coordinate->dms.seconds = 
+		coordinate->dm.degrees = coordinate->dm.minutes = coordinate->degrees = 0;
+		coordinate->dir = GNSS_CARDINAL_NONE;
+		return;
+	}
+
+	coordinate->dms.degrees = atoi(frag);
+	frag = find_next_gnss_param(frag, ' ');
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing dms position minute. String: %s", buf);
+		return;
+	}
+	
+	coordinate->dms.minutes = atoi(frag);
+	frag = find_next_gnss_param(frag, ' ');
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing dms position second. String: %s", buf);
+		return;
+	}
+	
+	coordinate->dms.seconds = strtof(frag, NULL);
+	frag = find_next_gnss_param(frag, ' ');
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing dms position direction. String: %s", buf);
+		return;
+	}
+
+	if(*frag == 'N')
+		coordinate->dir = GNSS_CARDINAL_NORTH;
+	else if(*frag == 'E')
+		coordinate->dir = GNSS_CARDINAL_EAST;
+	else if(*frag == 'S')
+		coordinate->dir = GNSS_CARDINAL_SOUTH;
+	else if(*frag == 'W')
+		coordinate->dir = GNSS_CARDINAL_WEST;
+	else
+	{
+		LOG_WRN("Unable to parse GNSS Cardinal Direction");
+		coordinate->dir = GNSS_CARDINAL_NONE;
+	}
+
+	coordinate->dm.degrees = coordinate->dms.degrees;
+	coordinate->dm.minutes = coordinate->dms.minutes + (coordinate->dms.seconds / 60);
+	coordinate->degrees = coordinate->dm.degrees + (coordinate->dm.minutes / 60);
+}
+
+void convert_type_string_to_enum(enum gnss_fix_type * type, char * buf)
+{
+	char * frag = buf;
+
+	frag = find_next_gnss_param(frag, ' ');
+
+	if(strcmp(" ", frag) == 0 || *frag == 0)
+	{
+		*type = GNSS_FIX_NONE;
+		return;
+	}
+
+	if(strcmp("2D", frag) == 0)
+		*type = GNSS_FIX_2D;
+	else if(strcmp("3D", frag) == 0)
+		*type = GNSS_FIX_3D;
+	else *type = GNSS_FIX_NONE;
+}
+
+void convert_numeric_string_to_float(float * number, char * buf)
+{
+	char * frag = buf;
+
+	frag = find_next_gnss_param(frag, ' ');
+
+	if(strcmp(" ", frag) == 0 || *frag == 0)
+	{
+		*number = 0;
+		return;
+	}
+
+	*number = strtof(frag, NULL);
+}
+
+void convert_gnss_time_string_to_tm(struct tm * timeVal, char * buf)
+{
+	char * frag = buf;
+
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing date year. String: %s", buf);
+		return;
+	}
+
+	if(strcmp(" ", frag) == 0 || *frag == 0)
+	{
+		return;
+	}
+
+	timeVal->tm_year = atol(frag);
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing date month. String: %s", buf);
+		return;
+	}
+	
+	timeVal->tm_mon = atol(frag);
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing date day. String: %s", buf);
+		return;
+	}
+	
+	timeVal->tm_mday = atol(frag);
+	frag = find_next_gnss_param(frag, ' ');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing time hour. String: %s", buf);
+		return;
+	}
+
+	timeVal->tm_hour = atol(frag);
+	frag = find_next_gnss_param(frag, ':');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing time minute. String: %s", buf);
+		return;
+	}
+
+	timeVal->tm_min = atol(frag);
+	frag = find_next_gnss_param(frag, ':');
+	if(!frag)
+	{
+		LOG_ERR("Error while parsing time second. String: %s", buf);
+		return;
+	}
+
+	timeVal->tm_sec = atol(frag);
+
+	timeVal->tm_isdst = 0;
+}
+
+void gnss_got_pos (struct k_work *work)
+{
+	int ret;
+	SEND_AT_CMD_EXPECT_OK("AT+GNSSSTOP");
+	SEND_AT_CMD_EXPECT_OK("AT+CFUN=1,0");
+
+error:
+	if(ret < 0)
+		LOG_ERR("Unable to disable airplane mode: %d", ret);
+}
+
+K_WORK_DEFINE(gnss_got_pos_work, gnss_got_pos);
+
+static bool on_cmd_gnss_fix_read (struct net_buf **buf, uint16_t len)
+{
+	struct net_buf *frag = NULL;
+	size_t out_len = 0;
+	int len_no_null = GNSS_POS_PARAM_MAX_LENGTH - 1;
+	uint8_t paramsLeft = GNSS_POS_PARAM_COUNT;
+	char lineBuffer[GNSS_POS_PARAM_MAX_LENGTH];
+
+	wait_for_modem_data_and_newline(buf, net_buf_frags_len(*buf),
+					GNSS_POS_MAX_LENGTH);
+	LOG_DBG("Location data received. Disabling airplane mode and parsing data");
+	k_work_submit(&gnss_got_pos_work);
+
+	net_buf_remove(buf, 2);	//The first line is just the "GNSSLOC:" response header
+	do
+	{
+		frag = NULL;
+		len = net_buf_findcrlf(*buf, &frag);
+		if (!frag) {
+			LOG_ERR("Unable to find gnss param %d end", GNSS_POS_PARAM_COUNT - paramsLeft);
+			goto error;
+		}
+		if(strcmp(lineBuffer, "FIX NOT AVAILABLE") == 0)
+		{
+			k_timer_start(&gnss_fix_timer, GNSS_POS_FIX_TIMEOUT, K_NO_WAIT);
+			net_buf_remove(buf, len + 2);		//len does not inclde the crlf
+			break;
+		}
+		if (len < gnssloc_lineHeaders[10 - paramsLeft]) {
+			LOG_WRN("gnss param %d too short (len:%d)", GNSS_POS_PARAM_COUNT - paramsLeft, len);
+		} else if (len > len_no_null) {
+			LOG_WRN("gnss param %d too long (len:%d)", GNSS_POS_PARAM_COUNT - paramsLeft, len);
+			len = GNSS_POS_PARAM_MAX_LENGTH;
+		}
+		out_len = net_buf_linearize(
+			lineBuffer, GNSS_POS_PARAM_MAX_LENGTH - 1, *buf, 0, len);
+		lineBuffer[out_len] = 0;
+		LOG_DBG("GNSSLOC Response: \"%s\"", log_strdup(lineBuffer));
+
+		//Actually process the strings
+		if(out_len == gnssloc_lineHeaders[10 - paramsLeft])
+			LOG_DBG("gnss param %d is empty", 10 - paramsLeft);
+			//Empty params are handled in the convert functions
+		else
+			switch(10 - paramsLeft)
+			{
+				case 0:		//Latitude
+					convert_pos_dms_string_to_struct(&location_data.latitude, lineBuffer);
+					break;
+				case 1:		//Longitude
+					convert_pos_dms_string_to_struct(&location_data.longitude, lineBuffer);
+					break;
+				case 2: 	//Time
+					convert_gnss_time_string_to_tm(&location_data.time, lineBuffer);
+					break;
+				case 3: 	//Type
+					convert_type_string_to_enum(&location_data.type, lineBuffer);
+					break;
+				case 4: 	//HEPE (Position Error)
+					convert_numeric_string_to_float(&location_data.posError, lineBuffer);
+					break;
+				case 5: 	//Altitde
+					convert_numeric_string_to_float(&location_data.altitude, lineBuffer);
+					break;
+				case 6: 	//Alt Uncertainty
+					convert_numeric_string_to_float(&location_data.altUncertainty, lineBuffer);
+					break;
+				case 7: 	//Direction
+					convert_numeric_string_to_float(&location_data.direction, lineBuffer);
+					break;
+				case 8:		//Horizontal Speed
+					convert_numeric_string_to_float(&location_data.horizSpeed, lineBuffer);
+					break;
+				case 9:	//Vertical Speed
+					convert_numeric_string_to_float(&location_data.vertSpeed, lineBuffer);
+					break;
+			}
+
+		//Get rid of processed data
+		net_buf_remove(buf, len + 2);		//len does not inclde the crlf
+
+		paramsLeft--;
+	}
+	while(paramsLeft);
+
+	LOG_INF("GNSS data processed");
+	if(location_data.callback != NULL)
+		location_data.callback(true);
+	return true;
+error:
+	return false;
+}

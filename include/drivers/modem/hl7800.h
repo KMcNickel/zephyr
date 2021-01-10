@@ -54,6 +54,57 @@ struct mdm_hl7800_apn {
 	char password[MDM_HL7800_APN_PASSWORD_MAX_SIZE];
 };
 
+enum gnss_cardinal_dir {
+	GNSS_CARDINAL_NONE,
+	GNSS_CARDINAL_SOUTH,
+	GNSS_CARDINAL_NORTH,
+	GNSS_CARDINAL_WEST,
+	GNSS_CARDINAL_EAST
+};
+
+extern char gnss_cardinal_shortLabel[];
+
+
+enum gnss_fix_type {
+	GNSS_FIX_NONE,
+	GNSS_FIX_2D,
+	GNSS_FIX_3D
+};
+
+struct gnss_coordinate_dm {
+	uint8_t degrees;
+	float minutes;
+};
+
+struct gnss_coordinate_dms {
+	uint8_t degrees;
+	uint8_t minutes;
+	float seconds;
+};
+
+struct gnss_coordinate {
+	float degrees;
+	struct gnss_coordinate_dm dm;
+	struct gnss_coordinate_dms dms;
+	enum gnss_cardinal_dir dir;
+};
+
+struct gnss_location_data {
+	struct gnss_coordinate latitude;
+	struct gnss_coordinate longitude;
+	struct tm time;
+	enum gnss_fix_type type;
+	float posError;
+	float altitude;
+	float altUncertainty;
+	float direction;
+	float horizSpeed;
+	float vertSpeed;
+	void (*callback)(bool fix_available);
+};
+
+extern struct gnss_location_data location_data;
+
 #define MDM_HL7800_LTE_BAND_STR_SIZE 21
 #define MDM_HL7800_LTE_BAND_STRLEN (MDM_HL7800_LTE_BAND_STR_SIZE - 1)
 
@@ -262,6 +313,8 @@ int32_t mdm_hl7800_get_local_time(struct tm *tm, int32_t *offset);
  */
 int32_t mdm_hl7800_update_fw(char *file_path);
 #endif
+
+void start_gnss ();
 
 #ifdef __cplusplus
 }

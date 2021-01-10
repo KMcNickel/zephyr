@@ -1,3 +1,12 @@
+boards/arm/bt6
+boards/arm/pinnacle_100_dvk
+boards/arm/bl653_dvk
+boards/arm/bt510
+boards/arm/bt710
+boards/arm/mg100
+boards/arm/README.md
+boards/arm/LICENSE
+
 *.o
 *.a
 *.d
