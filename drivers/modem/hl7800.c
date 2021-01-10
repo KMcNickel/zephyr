@@ -5113,6 +5113,12 @@ void convert_pos_dms_string_to_struct(struct gnss_coordinate * coordinate, char 
 	coordinate->dm.degrees = coordinate->dms.degrees;
 	coordinate->dm.minutes = coordinate->dms.minutes + (coordinate->dms.seconds / 60);
 	coordinate->degrees = coordinate->dm.degrees + (coordinate->dm.minutes / 60);
+	//We are going to use +/- for decimal degrees and decimal minutes
+	if(coordinate->dir == GNSS_CARDINAL_SOUTH || coordinate->dir == GNSS_CARDINAL_WEST)
+	{
+		coordinate->degrees = coordinate->degrees * -1;
+		coordinate->dm.degrees = coordinate->dm.degrees * -1;
+	}
 }
 
 void convert_type_string_to_enum(enum gnss_fix_type * type, char * buf)
